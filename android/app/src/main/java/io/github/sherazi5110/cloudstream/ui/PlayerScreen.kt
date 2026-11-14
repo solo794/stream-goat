@@ -40,6 +40,7 @@ import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Brightness6
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Forward10
@@ -97,6 +98,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import io.github.sherazi5110.cloudstream.Settings
+import io.github.sherazi5110.cloudstream.cast.Cast
 import io.github.sherazi5110.cloudstream.player.PlayerController
 import io.github.sherazi5110.cloudstream.player.Zoom
 import kotlinx.coroutines.delay
@@ -129,6 +131,9 @@ fun PlayerScreen(screen: Screen.Player) {
     var locked by remember { mutableStateOf(false) }
     var sheet by remember(screen) { mutableStateOf(if (screen.chooseSource) Sheet.SOURCES else null) }
     var poke by remember { mutableIntStateOf(0) } // any interaction restarts the hide timer
+    // Cast panel: open while picking a TV, and for as long as one is playing.
+    var castOpen by remember(screen) { mutableStateOf(false) }
+    val casting = castOpen || Cast.device != null || Cast.connecting
     var pinch by remember { mutableFloatStateOf(1f) }
     val rootFocus = remember { FocusRequester() }
     // Next-episode countdown: shown from the credits (or 20 s before the end); seeking back resets it.
@@ -145,6 +150,8 @@ fun PlayerScreen(screen: Screen.Player) {
     val playNext: () -> Unit = { c.next?.let { Nav.replace(Screen.Player(c.api, c.response, it)) } }
 
     DisposableEffect(c) { onDispose { c.release() } }
+    // Leaving the player ends the cast session (its controls live on this screen).
+    DisposableEffect(Unit) { onDispose { if (Cast.device != null) Cast.end() } }
 
     // Full screen, landscape on phones, screen kept on.
     DisposableEffect(Unit) {
@@ -190,6 +197,10 @@ fun PlayerScreen(screen: Screen.Player) {
 
     BackHandler {
         when {
+            casting -> {
+                if (Cast.device != null) io.github.sherazi5110.cloudstream.App.toast("Still casting: use Stop casting to come back")
+                else castOpen = false
+            }
             sheet != null -> sheet = null
             countdownLeft > 0 -> countdownCancelled = true
             isTv && controls && c.started -> controls = false
@@ -203,6 +214,7 @@ fun PlayerScreen(screen: Screen.Player) {
             .focusable()
             .onPreviewKeyEvent { e ->
                 if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                if (casting) return@onPreviewKeyEvent false // the cast panel has its own buttons
                 poke++
                 when (e.nativeKeyEvent.keyCode) {
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_SPACE -> { c.togglePause(); true }
@@ -247,7 +259,7 @@ fun PlayerScreen(screen: Screen.Player) {
                     RoundIcon(Icons.Filled.Lock, "Unlock", Modifier.padding(24.dp)) { locked = false; poke++ }
                 }
             } else AnimatedVisibility(controls, enter = fadeIn(), exit = fadeOut()) {
-                Controls(c, onSheet = { sheet = it }, onLock = { locked = true; poke++ }, poke = { poke++ })
+                Controls(c, onSheet = { sheet = it }, onLock = { locked = true; poke++ }, onCast = { castOpen = true }, poke = { poke++ })
             }
             val seg = c.activeSegment
             if (countdownLeft > 0) {
@@ -260,6 +272,8 @@ fun PlayerScreen(screen: Screen.Player) {
         }
 
         sheet?.let { s -> SheetPanel(s, c, Modifier.align(Alignment.CenterEnd), onOpen = { sheet = it }) { sheet = null } }
+
+        if (casting) CastPanel(c, onClose = { castOpen = false })
     }
 }
 
@@ -362,7 +376,7 @@ private fun RoundIcon(icon: ImageVector, label: String, modifier: Modifier = Mod
 }
 
 @Composable
-private fun Controls(c: PlayerController, onSheet: (Sheet) -> Unit, onLock: () -> Unit, poke: () -> Unit) {
+private fun Controls(c: PlayerController, onSheet: (Sheet) -> Unit, onLock: () -> Unit, onCast: () -> Unit, poke: () -> Unit) {
     val playFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { if (isTv) runCatching { playFocus.requestFocus() } }
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -378,6 +392,7 @@ private fun Controls(c: PlayerController, onSheet: (Sheet) -> Unit, onLock: () -
                 val sub = if (c.playables.size > 1) c.playable.label else c.current?.name
                 sub?.let { Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 1) }
             }
+            RoundIcon(Icons.Filled.Cast, "Cast to a TV", Modifier.padding(end = 10.dp)) { onCast() }
             if (!isTv) RoundIcon(Icons.Filled.LockOpen, "Lock") { onLock() }
             val ends = if (c.length > 0) " · ends ${timeFormat.format(Date(now + ((c.length - c.time) / c.speed).toLong()))}" else ""
             Text(timeFormat.format(Date(now)) + ends, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(start = 12.dp))

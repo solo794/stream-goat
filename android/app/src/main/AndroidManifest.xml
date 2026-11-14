@@ -8,6 +8,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Casting: finding TVs on the local network, and keeping the stream going with the screen off. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- One app for phones (touch) and Android TV (remote): neither is required. -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -28,6 +32,11 @@
             android:name="io.github.sherazi5110.cloudstream.DownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name="io.github.sherazi5110.cloudstream.cast.CastService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
 
         <activity
             android:name="io.github.sherazi5110.cloudstream.MainActivity"

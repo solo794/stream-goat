@@ -21,6 +21,9 @@ import java.util.concurrent.Executors
  * token headers on every request. The player opens `http://127.0.0.1:<port>/s/<id>/<name>`
  * instead; the proxy adds the extension's headers, passes Range through for seeking, and
  * rewrites HLS playlists so every variant playlist, segment and key goes through it too.
+ *
+ * Casting uses a second listener on the Wi-Fi address ([wrapLan]): a TV fetches the stream from the
+ * phone, which adds the headers the TV cannot send. Only URLs registered here are served.
  */
 object StreamProxy {
     private data class Target(val url: String, val headers: Map<String, String>)
@@ -37,20 +40,50 @@ object StreamProxy {
         pool.execute {
             while (!s.isClosed) {
                 val socket = runCatching { s.accept() }.getOrNull() ?: continue
-                pool.execute { socket.use { handle(it) } }
+                pool.execute { socket.use { handle(it, lan = false) } }
             }
         }
     }
 
+    // Casting: the same proxy, reachable from the local network while a cast session runs.
+    @Volatile private var lanServer: ServerSocket? = null
+    @Volatile private var lanHost: String = "127.0.0.1"
+
+    @Synchronized
+    private fun startLan(): ServerSocket = lanServer?.takeIf { !it.isClosed } ?: ServerSocket(0, 64).also { s ->
+        lanServer = s
+        pool.execute {
+            while (!s.isClosed) {
+                val socket = runCatching { s.accept() }.getOrNull() ?: continue
+                pool.execute { socket.use { handle(it, lan = true) } }
+            }
+        }
+    }
+
+    /** Like [wrap], for a device on the local network: [host] is this phone's address on that network. */
+    fun wrapLan(url: String, headers: Map<String, String>, host: String): String {
+        lanHost = host
+        return link(url, headers, lan = true)
+    }
+
+    /** Closes the local-network listener (the cast session ended). */
+    @Synchronized
+    fun stopLan() {
+        runCatching { lanServer?.close() }
+        lanServer = null
+    }
+
     /** Returns a loopback URL that fetches [url] with [headers]. */
-    fun wrap(url: String, headers: Map<String, String>): String {
-        val s = start()
+    fun wrap(url: String, headers: Map<String, String>): String = link(url, headers, lan = false)
+
+    private fun link(url: String, headers: Map<String, String>, lan: Boolean): String {
+        val s = if (lan) startLan() else start()
         val id = id(url, headers)
         targets[id] = Target(url, headers)
         // Keep the original file name/extension: the player uses it to guess the format.
         val name = runCatching { URI(url).path.substringAfterLast('/') }.getOrNull().orEmpty()
             .ifBlank { "stream" }.let { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
-        return "http://127.0.0.1:${s.localPort}/s/$id/$name"
+        return "http://${if (lan) lanHost else "127.0.0.1"}:${s.localPort}/s/$id/$name"
     }
 
     private fun id(url: String, headers: Map<String, String>): String {
@@ -68,7 +101,7 @@ object StreamProxy {
         }
     }
 
-    private fun handle(socket: Socket) {
+    private fun handle(socket: Socket, lan: Boolean) {
         val input = BufferedInputStream(socket.getInputStream())
         val out = socket.getOutputStream()
         val requestLine = readLine(input) ?: return
@@ -84,16 +117,23 @@ object StreamProxy {
         val headers = target.headers.toMutableMap()
         range?.let { headers["Range"] = it }
         val request = Request.Builder().url(target.url).headers(headers.toHeaders())
-            .apply { if (method == "HEAD") head() }
+            // A TV often asks HEAD first, which some hosts refuse: ask them GET and send back the headers only.
+            .apply { if (method == "HEAD" && !lan) head() }
             .build()
         try {
             app.baseClient.newCall(request).execute().use { response ->
                 val type = response.header("Content-Type").orEmpty()
-                val copied = response.headers.filter { (n, _) -> n.lowercase() !in skipResponse }
+                val copied = response.headers.filter { (n, _) -> n.lowercase() !in skipResponse }.toMutableList()
+                if (lan) {
+                    // What DLNA renderers look for before they agree to play (and to seek).
+                    if (copied.none { it.first.equals("Accept-Ranges", true) }) copied += "Accept-Ranges" to "bytes"
+                    copied += "transferMode.dlna.org" to "Streaming"
+                    copied += "contentFeatures.dlna.org" to "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                }
                 if (method != "HEAD" && isPlaylist(target.url, type)) {
                     val text = response.body.string()
                     if (text.trimStart().startsWith("#EXTM3U")) {
-                        val bytes = rewrite(text, response.request.url.toString(), target.headers).toByteArray()
+                        val bytes = rewrite(text, response.request.url.toString(), target.headers, lan).toByteArray()
                         respond(out, response.code, listOf("Content-Type" to "application/vnd.apple.mpegurl"), bytes)
                     } else respond(out, response.code, copied, text.toByteArray())
                     return
@@ -134,9 +174,9 @@ object StreamProxy {
     private val uriAttribute = Regex("URI=\"([^\"]+)\"")
 
     /** Points every URI in an HLS playlist (segments, variants, keys, maps) back at the proxy. */
-    fun rewrite(playlist: String, baseUrl: String, headers: Map<String, String>): String {
+    fun rewrite(playlist: String, baseUrl: String, headers: Map<String, String>, lan: Boolean = false): String {
         val base = URI(baseUrl)
-        fun proxied(ref: String) = wrap(base.resolve(ref.trim().replace(" ", "%20")).toString(), headers)
+        fun proxied(ref: String) = link(base.resolve(ref.trim().replace(" ", "%20")).toString(), headers, lan)
         return playlist.lineSequence().joinToString("\n") { line ->
             when {
                 line.isBlank() -> line
