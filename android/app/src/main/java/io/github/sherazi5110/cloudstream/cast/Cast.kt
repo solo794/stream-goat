@@ -1,5 +1,6 @@
 package io.github.sherazi5110.cloudstream.cast
 
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -15,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.SocketTimeoutException
 
 /**
  * The cast session: one TV (a DLNA renderer) playing what the player screen sent it.
@@ -45,9 +47,16 @@ object Cast {
         private set
     var live by mutableStateOf(false)
         private set
+    /** What the connection attempt is doing now ("Trying through this phone (1/3)…"). */
+    var step by mutableStateOf("")
+        private set
+    /** Why attempts failed, one line each: shown under the error so it can be read off a screenshot. */
+    val log = mutableStateListOf<String>()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var poll: Job? = null
+    private var job: Job? = null
+    private var attempt = 0
 
     val playing: Boolean get() = state == "PLAYING" || state == "TRANSITIONING"
 
@@ -70,45 +79,120 @@ object Cast {
         if (link.referer.isNotBlank() && keys.none { it.equals("Referer", true) }) put("Referer", link.referer)
     }
 
+    private data class Plan(val label: String, val viaPhone: Boolean, val mime: String, val meta: Dlna.Meta)
+
+    private suspend fun <T> io(block: () -> T): Result<T> = withContext(Dispatchers.IO) { runCatching { block() } }
+
+    private fun describe(e: Throwable): String = when (e) {
+        is SocketTimeoutException -> "got no answer from the TV (timeout)"
+        is java.net.ConnectException -> "could not connect to the TV"
+        else -> e.message ?: e.toString()
+    }
+
     /**
-     * Sends [link] to [target], starting at [startMs]. A source that needs headers (most do) goes through the
-     * phone's proxy, since a TV sends none of them; a plain URL is fetched by the TV directly.
+     * Sends [link] to [target], starting at [startMs]. TVs differ a lot in what they accept, so it tries in turn:
+     * through this phone (which adds the headers a TV cannot send and hands the TV plain http), through the
+     * phone again with a bare request, and, when the source needs no headers, straight from the source.
      */
     fun start(target: Dlna.Device, link: ExtractorLink, name: String, startMs: Long, isLive: Boolean) {
         if (connecting) return
         if (!link.url.startsWith("http", ignoreCase = true)) { error = "Only online sources can be cast (not downloaded files)."; return }
         connecting = true
         error = null
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    val headers = headersOf(link)
-                    val url = if (headers.isEmpty()) link.url else {
-                        val me = Dlna.localAddressFor(target.host) ?: throw IllegalStateException("This device has no local network address (is Wi-Fi on?)")
-                        StreamProxy.wrapLan(link.url, headers, me)
-                    }
-                    val mime = Dlna.mimeOf(link.url, link.isM3u8, link.type.name == "DASH")
-                    Dlna.setUri(target, url, name, mime)
-                    Dlna.play(target)
-                    runCatching { Dlna.volume(target) }.getOrNull()
-                }
+        log.clear()
+        step = "Connecting to ${target.name}…"
+        val mine = ++attempt
+        job = scope.launch {
+            var failure: String? = null
+            try {
+                failure = connect(target, link, name, isLive)
+            } finally {
+                if (attempt == mine) { connecting = false; step = "" }
             }
-            connecting = false
-            result.onFailure { e ->
-                error = "${target.name} refused the stream: ${e.message ?: e.toString()}"
+            if (attempt != mine) return@launch
+            if (failure != null) {
+                error = "${target.name} did not play the stream. $failure"
                 StreamProxy.stopLan()
-            }.onSuccess { v ->
-                device = target
-                title = name
-                live = isLive
-                volume = v
-                state = "TRANSITIONING"
-                positionMs = startMs
-                durationMs = 0
-                CastService.start(App.context)
-                watch(target, if (isLive) 0 else startMs)
+                return@launch
             }
+            val v = io { Dlna.volume(target) }.getOrNull()
+            device = target
+            title = name
+            live = isLive
+            volume = v
+            state = "PLAYING"
+            positionMs = startMs
+            durationMs = 0
+            CastService.start(App.context)
+            watch(target, if (isLive) 0 else startMs)
         }
+    }
+
+    /** Gives up on a connection attempt that is still running (the panel was closed). */
+    fun cancel() {
+        if (!connecting) return
+        attempt++
+        job?.cancel()
+        connecting = false
+        step = ""
+        StreamProxy.stopLan()
+    }
+
+    /** Null when the TV is playing; otherwise why it was not. */
+    private suspend fun connect(target: Dlna.Device, link: ExtractorLink, name: String, isLive: Boolean): String? {
+        val headers = headersOf(link)
+        val mime = Dlna.mimeOf(link.url, link.isM3u8, link.type.name == "DASH")
+        val plans = buildList {
+            add(Plan("through this phone", true, mime, Dlna.Meta.FULL))
+            add(Plan("through this phone, bare request", true, Dlna.altMime(mime), Dlna.Meta.NONE))
+            if (headers.isEmpty()) add(Plan("straight from the source", false, mime, Dlna.Meta.FULL))
+        }
+        val began = SystemClock.elapsedRealtime()
+        for ((i, plan) in plans.withIndex()) {
+            if (i > 0 && SystemClock.elapsedRealtime() - began > 70_000) break
+            step = "Trying ${plan.label} (${i + 1}/${plans.size})…"
+            val url = if (plan.viaPhone) {
+                val me = io { Dlna.localAddressFor(target.host) }.getOrNull()
+                    ?: return "This device has no local network address (is Wi-Fi on?)"
+                StreamProxy.wrapLan(link.url, headers, me)
+            } else link.url
+            val before = StreamProxy.lanRequests()
+            io { Dlna.stopQuick(target) }
+            val setError = io { Dlna.setUri(target, url, name, plan.mime, isLive, plan.meta) }.exceptionOrNull()
+            if (setError != null) {
+                log += "${plan.label}: SetAVTransportURI ${describe(setError)}"
+                // A refusal will not change by waiting. A TV that is only slow may still have taken the URL.
+                if (setError !is SocketTimeoutException) continue
+            }
+            io { Dlna.play(target) }.exceptionOrNull()?.let { log += "${plan.label}: Play ${describe(it)}" }
+            val why = waitPlaying(target, before, plan.viaPhone) ?: return null
+            log += "${plan.label}: $why"
+        }
+        return "Details below."
+    }
+
+    /** Waits for the TV to start playing; null when it did, otherwise what it was doing instead. */
+    private suspend fun waitPlaying(target: Dlna.Device, before: Int, viaPhone: Boolean): String? {
+        var deadline = SystemClock.elapsedRealtime() + 15_000
+        var extended = false
+        var last = ""
+        while (SystemClock.elapsedRealtime() < deadline) {
+            delay(800)
+            val s = io { Dlna.status(target) }.getOrNull()
+            if (s != null) {
+                last = s.state
+                if (s.state == "PLAYING" || s.state == "PAUSED_PLAYBACK") return null
+            }
+            // The TV is fetching the stream from this phone: give it longer to start.
+            if (!extended && viaPhone && StreamProxy.lanRequests() > before) { extended = true; deadline += 12_000 }
+        }
+        val hits = StreamProxy.lanRequests() - before
+        val seen = when {
+            !viaPhone -> ""
+            hits == 0 -> "; the TV never asked this phone for the stream"
+            else -> "; the TV asked this phone $hits time(s): ${StreamProxy.lanLog().takeLast(4).joinToString(", ")}"
+        }
+        return "TV state ${last.ifBlank { "unknown (no answer)" }}$seen"
     }
 
     /** Follows the TV's state once a second; jumps to [resumeMs] as soon as it plays. */

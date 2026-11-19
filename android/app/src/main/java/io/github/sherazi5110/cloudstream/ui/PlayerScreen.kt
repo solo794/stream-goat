@@ -199,7 +199,7 @@ fun PlayerScreen(screen: Screen.Player) {
         when {
             casting -> {
                 if (Cast.device != null) io.github.sherazi5110.cloudstream.App.toast("Still casting: use Stop casting to come back")
-                else castOpen = false
+                else { Cast.cancel(); castOpen = false }
             }
             sheet != null -> sheet = null
             countdownLeft > 0 -> countdownCancelled = true

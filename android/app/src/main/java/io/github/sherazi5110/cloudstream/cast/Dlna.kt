@@ -30,6 +30,7 @@ object Dlna {
         val avTransport: String,
         val rendering: String?,
         val location: String,
+        val maker: String = "",
     )
 
     data class Status(val state: String, val positionMs: Long, val durationMs: Long)
@@ -113,7 +114,8 @@ object Dlna {
         val transport = avUrl ?: return null
         val host = URL(location).host
         val name = tag(xml, "friendlyName")?.let { unescape(it) }?.takeIf { it.isNotBlank() } ?: host
-        return Device(name, host, transport, rcUrl, location)
+        val maker = tag(xml, "manufacturer")?.let { unescape(it) }.orEmpty()
+        return Device(name, host, transport, rcUrl, location, maker)
     }
 
     private fun httpGet(url: String): String {
@@ -127,7 +129,7 @@ object Dlna {
         }
     }
 
-    private fun soap(control: String, service: String, action: String, args: List<Pair<String, String>>): String {
+    private fun soap(control: String, service: String, action: String, args: List<Pair<String, String>>, timeoutMs: Int = 10_000): String {
         val body = buildString {
             append("<?xml version=\"1.0\" encoding=\"utf-8\"?>")
             append("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">")
@@ -139,10 +141,12 @@ object Dlna {
         try {
             c.requestMethod = "POST"
             c.connectTimeout = 4000
-            c.readTimeout = 10000
+            c.readTimeout = timeoutMs
             c.doOutput = true
             c.setFixedLengthStreamingMode(body.size)
             c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+            c.setRequestProperty("User-Agent", "Linux/4.9 UPnP/1.0 StreamGoat/1.0")
+            c.setRequestProperty("Connection", "close")
             c.setRequestProperty("SOAPAction", "\"$service#$action\"")
             c.outputStream.use { it.write(body) }
             val code = c.responseCode
@@ -158,8 +162,10 @@ object Dlna {
         }
     }
 
-    private fun av(d: Device, action: String, vararg args: Pair<String, String>) =
-        soap(d.avTransport, AV_TRANSPORT, action, listOf("InstanceID" to "0") + args)
+    private fun avT(d: Device, action: String, timeoutMs: Int, args: List<Pair<String, String>>) =
+        soap(d.avTransport, AV_TRANSPORT, action, listOf("InstanceID" to "0") + args, timeoutMs)
+
+    private fun av(d: Device, action: String, vararg args: Pair<String, String>) = avT(d, action, 10_000, args.toList())
 
     /** The MIME type a renderer should expect for [url]. */
     fun mimeOf(url: String, hls: Boolean, dash: Boolean): String {
@@ -175,24 +181,36 @@ object Dlna {
         }
     }
 
-    /** Loads [url] on the renderer (not playing yet). */
-    fun setUri(d: Device, url: String, title: String, mime: String) {
-        val features = if (mime == "video/mp4") "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000" else "*"
-        val meta = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+    /** How much of the DLNA description a renderer gets: some refuse (or hang on) the full one. */
+    enum class Meta { FULL, MINIMAL, NONE }
+
+    /** Another spelling of the format, for renderers that only know one of them. */
+    fun altMime(mime: String): String = when (mime) {
+        "application/vnd.apple.mpegurl" -> "application/x-mpegURL"
+        "video/x-matroska" -> "video/x-mkv"
+        "video/mp2t" -> "video/mpeg"
+        else -> mime
+    }
+
+    private fun metadata(url: String, title: String, mime: String, live: Boolean, mode: Meta): String {
+        if (mode == Meta.NONE) return ""
+        val features = if (mode == Meta.MINIMAL) "*"
+            else "DLNA.ORG_OP=${if (live) "00" else "01"};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
             "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"><item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
             "<dc:title>${escape(title)}</dc:title><upnp:class>object.item.videoItem</upnp:class>" +
             "<res protocolInfo=\"http-get:*:$mime:$features\">${escape(url)}</res></item></DIDL-Lite>"
-        // A renderer that is busy with something else refuses a new URL: stop it first (failing is fine).
-        runCatching { av(d, "Stop") }
-        try {
-            av(d, "SetAVTransportURI", "CurrentURI" to url, "CurrentURIMetaData" to meta)
-        } catch (e: IOException) {
-            // Some renderers choke on the metadata: try once more without it.
-            av(d, "SetAVTransportURI", "CurrentURI" to url, "CurrentURIMetaData" to "")
-        }
     }
 
-    fun play(d: Device) { av(d, "Play", "Speed" to "1") }
+    /** Stops whatever the TV is playing, quickly: an idle renderer answers an error, or nothing. */
+    fun stopQuick(d: Device) { runCatching { avT(d, "Stop", 2_500, emptyList()) } }
+
+    /** Loads [url] on the renderer (not playing yet). A slow renderer gets 15 s to answer. */
+    fun setUri(d: Device, url: String, title: String, mime: String, live: Boolean, mode: Meta) {
+        avT(d, "SetAVTransportURI", 15_000, listOf("CurrentURI" to url, "CurrentURIMetaData" to metadata(url, title, mime, live, mode)))
+    }
+
+    fun play(d: Device) { avT(d, "Play", 12_000, listOf("Speed" to "1")) }
     fun pause(d: Device) { av(d, "Pause") }
     fun stop(d: Device) { av(d, "Stop") }
 
@@ -210,8 +228,8 @@ object Dlna {
     }
 
     fun status(d: Device): Status {
-        val state = tag(av(d, "GetTransportInfo"), "CurrentTransportState").orEmpty()
-        val position = av(d, "GetPositionInfo")
+        val state = tag(avT(d, "GetTransportInfo", 4_000, emptyList()), "CurrentTransportState").orEmpty()
+        val position = avT(d, "GetPositionInfo", 4_000, emptyList())
         return Status(state, parseTime(tag(position, "RelTime")), parseTime(tag(position, "TrackDuration")))
     }
 

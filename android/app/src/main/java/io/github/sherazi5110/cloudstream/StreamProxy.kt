@@ -12,7 +12,10 @@ import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import io.github.sherazi5110.cloudstream.cast.Dlna
 
 /**
  * Loopback HTTP proxy for the player (Android port of the Linux app's StreamProxy).
@@ -48,6 +51,19 @@ object StreamProxy {
     // Casting: the same proxy, reachable from the local network while a cast session runs.
     @Volatile private var lanServer: ServerSocket? = null
     @Volatile private var lanHost: String = "127.0.0.1"
+    private val lanCount = AtomicInteger()
+    private val lanEvents = ConcurrentLinkedDeque<String>()
+
+    /** How many requests TVs made to the local-network listener: tells "never connected" from "did not like it". */
+    fun lanRequests(): Int = lanCount.get()
+
+    /** The last few requests a TV made, and how they were answered. */
+    fun lanLog(): List<String> = lanEvents.toList()
+
+    private fun lanNote(text: String) {
+        lanEvents.addLast(text)
+        while (lanEvents.size > 8) lanEvents.pollFirst()
+    }
 
     @Synchronized
     private fun startLan(): ServerSocket = lanServer?.takeIf { !it.isClosed } ?: ServerSocket(0, 64).also { s ->
@@ -71,6 +87,7 @@ object StreamProxy {
     fun stopLan() {
         runCatching { lanServer?.close() }
         lanServer = null
+        lanEvents.clear()
     }
 
     /** Returns a loopback URL that fetches [url] with [headers]. */
@@ -106,6 +123,7 @@ object StreamProxy {
         val out = socket.getOutputStream()
         val requestLine = readLine(input) ?: return
         val (method, path) = requestLine.split(" ").let { (it.getOrNull(0) ?: "GET") to (it.getOrNull(1) ?: "/") }
+        if (lan) lanCount.incrementAndGet()
         var range: String? = null
         while (true) {
             val line = readLine(input) ?: break
@@ -113,7 +131,10 @@ object StreamProxy {
             if (line.startsWith("range:", ignoreCase = true)) range = line.substringAfter(':').trim()
         }
         val id = path.removePrefix("/s/").substringBefore('/')
-        val target = targets[id] ?: return respond(out, 404, emptyList(), null)
+        val target = targets[id] ?: run {
+            if (lan) lanNote("$method → 404 (unknown link)")
+            return respond(out, 404, emptyList(), null)
+        }
         val headers = target.headers.toMutableMap()
         range?.let { headers["Range"] = it }
         val request = Request.Builder().url(target.url).headers(headers.toHeaders())
@@ -123,8 +144,15 @@ object StreamProxy {
         try {
             app.baseClient.newCall(request).execute().use { response ->
                 val type = response.header("Content-Type").orEmpty()
+                if (lan) lanNote("$method${if (range != null) " (range)" else ""} → ${response.code} ${type.substringBefore(';').ifBlank { "no type" }}")
                 val copied = response.headers.filter { (n, _) -> n.lowercase() !in skipResponse }.toMutableList()
                 if (lan) {
+                    // A TV needs a video type to agree to play; hosts sometimes send none, or a generic one.
+                    val ct = type.lowercase()
+                    if (ct.isBlank() || "octet-stream" in ct || ct.startsWith("text/")) {
+                        copied.removeAll { it.first.equals("Content-Type", true) }
+                        copied += "Content-Type" to Dlna.mimeOf(target.url, false, false)
+                    }
                     // What DLNA renderers look for before they agree to play (and to seek).
                     if (copied.none { it.first.equals("Accept-Ranges", true) }) copied += "Accept-Ranges" to "bytes"
                     copied += "transferMode.dlna.org" to "Streaming"
@@ -151,6 +179,7 @@ object StreamProxy {
             }
         } catch (t: Throwable) {
             // The player closing a connection mid-stream (seek, stop) lands here too.
+            if (lan) lanNote("$method → failed: ${t.javaClass.simpleName} ${t.message.orEmpty().take(50)}")
             runCatching { respond(out, 502, emptyList(), null) }
         }
     }

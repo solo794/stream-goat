@@ -75,14 +75,15 @@ fun CastPanel(c: PlayerController, onClose: () -> Unit) {
                 }
                 Text(
                     when {
-                        Cast.connecting -> "Connecting…"
+                        Cast.connecting -> Cast.step.ifBlank { "Connecting…" }
                         Cast.scanning -> "Looking for TVs on this Wi-Fi…"
                         Cast.devices.isEmpty() -> "No TV found. The TV and this device must be on the same Wi-Fi, and the TV switched on."
                         else -> "Pick a TV. It plays the stream itself; this device becomes the remote."
                     },
                     style = MaterialTheme.typography.bodyMedium, color = Palette.muted, modifier = Modifier.padding(top = 6.dp, bottom = 8.dp))
                 if (Cast.scanning || Cast.connecting) LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 8.dp), color = Palette.accent, trackColor = Color.White.copy(alpha = 0.15f))
-                Cast.error?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = Color(0xFFFF8A80), modifier = Modifier.padding(bottom = 8.dp)) }
+                Cast.error?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = Color(0xFFFF8A80), modifier = Modifier.padding(bottom = 4.dp)) }
+                if (Cast.log.isNotEmpty()) Text(Cast.log.joinToString("\n"), style = MaterialTheme.typography.bodySmall, color = Palette.muted, modifier = Modifier.padding(bottom = 8.dp))
 
                 Cast.devices.forEachIndexed { i, d ->
                     DeviceRow(d, if (i == 0) Modifier.focusRequester(first) else Modifier) {
@@ -104,7 +105,7 @@ fun CastPanel(c: PlayerController, onClose: () -> Unit) {
                         }
                         if (!opened) App.toast("This device has no screen mirroring settings")
                     }
-                    PillButton("Close", null, primary = false, compact = true) { onClose() }
+                    PillButton("Close", null, primary = false, compact = true) { Cast.cancel(); onClose() }
                 }
             } else {
                 Text("Casting to ${device.name}", style = MaterialTheme.typography.headlineSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -170,7 +171,7 @@ private fun DeviceRow(d: Dlna.Device, modifier: Modifier, onClick: () -> Unit) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(d.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(d.host, style = MaterialTheme.typography.bodySmall, color = Palette.muted)
+            Text(listOf(d.maker, d.host).filter { it.isNotBlank() }.joinToString(" · "), style = MaterialTheme.typography.bodySmall, color = Palette.muted)
         }
     }
 }
