@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import io.github.sherazi5110.cloudstream.cast.Dlna
 
 /**
@@ -29,7 +30,10 @@ import io.github.sherazi5110.cloudstream.cast.Dlna
  * phone, which adds the headers the TV cannot send. Only URLs registered here are served.
  */
 object StreamProxy {
-    private data class Target(val url: String, val headers: Map<String, String>)
+    private data class Target(val url: String, val headers: Map<String, String>, val lanMime: String? = null, val chunked: Boolean = false)
+
+    /** What a source answers with: its type, and its length when it has one (a live stream has none). */
+    data class Probe(val contentType: String, val length: Long?)
 
     private val targets = ConcurrentHashMap<String, Target>()
     @Volatile private var server: ServerSocket? = null
@@ -77,10 +81,18 @@ object StreamProxy {
     }
 
     /** Like [wrap], for a device on the local network: [host] is this phone's address on that network. */
-    fun wrapLan(url: String, headers: Map<String, String>, host: String): String {
+    fun wrapLan(url: String, headers: Map<String, String>, host: String, mime: String? = null, chunked: Boolean = false): String {
         lanHost = host
-        return link(url, headers, lan = true)
+        return link(url, headers, lan = true, mime = mime, chunked = chunked)
     }
+
+    /** Asks the source for its headers only (blocks: call off the main thread). */
+    fun probe(url: String, headers: Map<String, String>): Probe? = runCatching {
+        val request = Request.Builder().url(url).headers(headers.toHeaders()).build()
+        app.baseClient.newCall(request).execute().use { r ->
+            Probe(r.header("Content-Type").orEmpty().substringBefore(';').trim().lowercase(), r.header("Content-Length")?.toLongOrNull())
+        }
+    }.getOrNull()
 
     /** Closes the local-network listener (the cast session ended). */
     @Synchronized
@@ -93,18 +105,18 @@ object StreamProxy {
     /** Returns a loopback URL that fetches [url] with [headers]. */
     fun wrap(url: String, headers: Map<String, String>): String = link(url, headers, lan = false)
 
-    private fun link(url: String, headers: Map<String, String>, lan: Boolean): String {
+    private fun link(url: String, headers: Map<String, String>, lan: Boolean, mime: String? = null, chunked: Boolean = false): String {
         val s = if (lan) startLan() else start()
-        val id = id(url, headers)
-        targets[id] = Target(url, headers)
+        val id = id(url, headers, mime.orEmpty() + chunked)
+        targets[id] = Target(url, headers, mime, chunked)
         // Keep the original file name/extension: the player uses it to guess the format.
         val name = runCatching { URI(url).path.substringAfterLast('/') }.getOrNull().orEmpty()
             .ifBlank { "stream" }.let { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
         return "http://${if (lan) lanHost else "127.0.0.1"}:${s.localPort}/s/$id/$name"
     }
 
-    private fun id(url: String, headers: Map<String, String>): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest((url + "\n" + headers.toSortedMap()).toByteArray())
+    private fun id(url: String, headers: Map<String, String>, extra: String = ""): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest((url + "\n" + headers.toSortedMap() + extra).toByteArray())
         return digest.take(12).joinToString("") { "%02x".format(it) }
     }
 
@@ -137,6 +149,8 @@ object StreamProxy {
         }
         val headers = target.headers.toMutableMap()
         range?.let { headers["Range"] = it }
+        val sent = AtomicLong()
+        val t0 = System.currentTimeMillis()
         val request = Request.Builder().url(target.url).headers(headers.toHeaders())
             // A TV often asks HEAD first, which some hosts refuse: ask them GET and send back the headers only.
             .apply { if (method == "HEAD" && !lan) head() }
@@ -144,19 +158,26 @@ object StreamProxy {
         try {
             app.baseClient.newCall(request).execute().use { response ->
                 val type = response.header("Content-Type").orEmpty()
-                if (lan) lanNote("$method${if (range != null) " (range)" else ""} → ${response.code} ${type.substringBefore(';').ifBlank { "no type" }}")
+                if (lan) lanNote("$method${if (range != null) " [$range]" else ""} → ${response.code} ${type.substringBefore(';').ifBlank { "no type" }}")
                 val copied = response.headers.filter { (n, _) -> n.lowercase() !in skipResponse }.toMutableList()
                 if (lan) {
                     // A TV needs a video type to agree to play; hosts sometimes send none, or a generic one.
                     val ct = type.lowercase()
-                    if (ct.isBlank() || "octet-stream" in ct || ct.startsWith("text/")) {
+                    val forced = target.lanMime
+                    if (forced != null) {
+                        copied.removeAll { it.first.equals("Content-Type", true) }
+                        copied += "Content-Type" to forced
+                    } else if (ct.isBlank() || "octet-stream" in ct || ct.startsWith("text/")) {
                         copied.removeAll { it.first.equals("Content-Type", true) }
                         copied += "Content-Type" to Dlna.mimeOf(target.url, false, false)
                     }
-                    // What DLNA renderers look for before they agree to play (and to seek).
-                    if (copied.none { it.first.equals("Accept-Ranges", true) }) copied += "Accept-Ranges" to "bytes"
+                    // A stream with no length (live TV) cannot be sought: saying it can makes some TVs
+                    // wait for a length or ask for ranges for ever.
+                    val seekable = response.header("Content-Length") != null || response.code == 206
+                    copied.removeAll { it.first.equals("Accept-Ranges", true) }
+                    if (seekable) copied += "Accept-Ranges" to "bytes"
                     copied += "transferMode.dlna.org" to "Streaming"
-                    copied += "contentFeatures.dlna.org" to "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                    copied += "contentFeatures.dlna.org" to "DLNA.ORG_OP=${if (seekable) "01" else "00"};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
                 }
                 if (method != "HEAD" && isPlaylist(target.url, type)) {
                     val text = response.body.string()
@@ -167,21 +188,40 @@ object StreamProxy {
                     return
                 }
                 val length = response.header("Content-Length")
+                val chunked = lan && target.chunked && length == null && method != "HEAD"
                 val head = buildString {
                     append("HTTP/1.1 ${response.code} ${response.message.ifBlank { "OK" }}\r\n")
                     copied.forEach { (n, v) -> append("$n: $v\r\n") }
                     length?.let { append("Content-Length: $it\r\n") }
+                    if (chunked) append("Transfer-Encoding: chunked\r\n")
                     append("Connection: close\r\n\r\n")
                 }
                 out.write(head.toByteArray())
-                if (method != "HEAD") response.body.byteStream().use { it.copyTo(out, 64 * 1024) }
+                if (method != "HEAD") response.body.byteStream().use { pump(it, out, chunked, sent) }
                 out.flush()
+                if (lan && method != "HEAD") lanNote("$method → sent ${sent.get() / 1024} KB in ${(System.currentTimeMillis() - t0) / 100 / 10.0} s, then it ended")
             }
         } catch (t: Throwable) {
             // The player closing a connection mid-stream (seek, stop) lands here too.
-            if (lan) lanNote("$method → failed: ${t.javaClass.simpleName} ${t.message.orEmpty().take(50)}")
+            if (lan) lanNote("$method → stopped after ${sent.get() / 1024} KB, ${(System.currentTimeMillis() - t0) / 100 / 10.0} s: ${t.javaClass.simpleName} ${t.message.orEmpty().take(40)}")
             runCatching { respond(out, 502, emptyList(), null) }
         }
+    }
+
+    /** Copies a body to the client as it arrives; [chunked] frames it with Transfer-Encoding: chunked. */
+    private fun pump(src: java.io.InputStream, out: OutputStream, chunked: Boolean, sent: AtomicLong) {
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = src.read(buf)
+            if (n < 0) break
+            if (n == 0) continue
+            if (chunked) out.write("${Integer.toHexString(n)}\r\n".toByteArray())
+            out.write(buf, 0, n)
+            if (chunked) out.write("\r\n".toByteArray())
+            out.flush()
+            sent.addAndGet(n.toLong())
+        }
+        if (chunked) { out.write("0\r\n\r\n".toByteArray()); out.flush() }
     }
 
     private fun respond(out: OutputStream, code: Int, headers: List<Pair<String, String>>, body: ByteArray?) {

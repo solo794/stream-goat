@@ -202,8 +202,15 @@ object Dlna {
             "<res protocolInfo=\"http-get:*:$mime:$features\">${escape(url)}</res></item></DIDL-Lite>"
     }
 
-    /** Stops whatever the TV is playing, quickly: an idle renderer answers an error, or nothing. */
-    fun stopQuick(d: Device) { runCatching { avT(d, "Stop", 2_500, emptyList()) } }
+    /** Stops the TV and waits a few seconds until it is idle: a renderer still loading refuses a new URL. */
+    fun resetTransport(d: Device) {
+        runCatching { avT(d, "Stop", 4_000, emptyList()) }
+        repeat(6) {
+            val state = runCatching { tag(avT(d, "GetTransportInfo", 2_000, emptyList()), "CurrentTransportState").orEmpty() }.getOrDefault("")
+            if (state.isEmpty() || state == "STOPPED" || state == "NO_MEDIA_PRESENT") return
+            Thread.sleep(600)
+        }
+    }
 
     /** Loads [url] on the renderer (not playing yet). A slow renderer gets 15 s to answer. */
     fun setUri(d: Device, url: String, title: String, mime: String, live: Boolean, mode: Meta) {

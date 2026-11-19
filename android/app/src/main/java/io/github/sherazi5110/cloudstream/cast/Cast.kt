@@ -79,7 +79,7 @@ object Cast {
         if (link.referer.isNotBlank() && keys.none { it.equals("Referer", true) }) put("Referer", link.referer)
     }
 
-    private data class Plan(val label: String, val viaPhone: Boolean, val mime: String, val meta: Dlna.Meta)
+    private data class Plan(val label: String, val viaPhone: Boolean, val mime: String, val meta: Dlna.Meta, val chunked: Boolean = false)
 
     private suspend fun <T> io(block: () -> T): Result<T> = withContext(Dispatchers.IO) { runCatching { block() } }
 
@@ -141,10 +141,22 @@ object Cast {
     /** Null when the TV is playing; otherwise why it was not. */
     private suspend fun connect(target: Dlna.Device, link: ExtractorLink, name: String, isLive: Boolean): String? {
         val headers = headersOf(link)
-        val mime = Dlna.mimeOf(link.url, link.isM3u8, link.type.name == "DASH")
+        // What the source really is, not what its address suggests (many have no extension).
+        step = "Checking the source…"
+        val probe = io { StreamProxy.probe(link.url, headers) }.getOrNull()
+        val served = probe?.contentType.orEmpty()
+        val hls = link.isM3u8 || "mpegurl" in served
+        val mime = when {
+            hls -> "application/vnd.apple.mpegurl"
+            served.startsWith("video/") -> served
+            else -> Dlna.mimeOf(link.url, link.isM3u8, link.type.name == "DASH")
+        }
+        // No length means a live stream: it cannot be sought, and a TV wants to be told so.
+        val live = isLive || (!hls && probe?.length == null)
         val plans = buildList {
             add(Plan("through this phone", true, mime, Dlna.Meta.FULL))
-            add(Plan("through this phone, bare request", true, Dlna.altMime(mime), Dlna.Meta.NONE))
+            add(Plan(if (live) "through this phone, chunked, other format" else "through this phone, bare request", true,
+                Dlna.altMime(mime), if (live) Dlna.Meta.FULL else Dlna.Meta.NONE, chunked = live))
             if (headers.isEmpty()) add(Plan("straight from the source", false, mime, Dlna.Meta.FULL))
         }
         val began = SystemClock.elapsedRealtime()
@@ -154,11 +166,11 @@ object Cast {
             val url = if (plan.viaPhone) {
                 val me = io { Dlna.localAddressFor(target.host) }.getOrNull()
                     ?: return "This device has no local network address (is Wi-Fi on?)"
-                StreamProxy.wrapLan(link.url, headers, me)
+                StreamProxy.wrapLan(link.url, headers, me, plan.mime, plan.chunked)
             } else link.url
             val before = StreamProxy.lanRequests()
-            io { Dlna.stopQuick(target) }
-            val setError = io { Dlna.setUri(target, url, name, plan.mime, isLive, plan.meta) }.exceptionOrNull()
+            io { Dlna.resetTransport(target) }
+            val setError = io { Dlna.setUri(target, url, name, plan.mime, live, plan.meta) }.exceptionOrNull()
             if (setError != null) {
                 log += "${plan.label}: SetAVTransportURI ${describe(setError)}"
                 // A refusal will not change by waiting. A TV that is only slow may still have taken the URL.
