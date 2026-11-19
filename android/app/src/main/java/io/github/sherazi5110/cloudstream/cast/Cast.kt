@@ -53,6 +53,10 @@ object Cast {
     /** Why attempts failed, one line each: shown under the error so it can be read off a screenshot. */
     val log = mutableStateListOf<String>()
 
+    /** True while the TV plays through LG's own app launch (StreamBox on the TV), not DLNA: no position or seeking then. */
+    var lgMode by mutableStateOf(false)
+        private set
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var poll: Job? = null
     private var job: Job? = null
@@ -104,8 +108,13 @@ object Cast {
         val mine = ++attempt
         job = scope.launch {
             var failure: String? = null
+            var viaLg = false
             try {
-                failure = connect(target, link, name, isLive)
+                if (target.maker.contains("LG", ignoreCase = true)) {
+                    val lgFailure = connectLg(target, link, name, startMs, isLive)
+                    if (lgFailure == null) viaLg = true else log += "LG remote service: $lgFailure"
+                }
+                if (!viaLg) failure = connect(target, link, name, isLive)
             } finally {
                 if (attempt == mine) { connecting = false; step = "" }
             }
@@ -115,16 +124,39 @@ object Cast {
                 StreamProxy.stopLan()
                 return@launch
             }
-            val v = io { Dlna.volume(target) }.getOrNull()
+            lgMode = viaLg
+            val v = if (viaLg) runCatching { Lg.volume() }.getOrNull() else io { Dlna.volume(target) }.getOrNull()
             device = target
             title = name
-            live = isLive
+            live = isLive || viaLg
             volume = v
             state = "PLAYING"
             positionMs = startMs
             durationMs = 0
             CastService.start(App.context)
-            watch(target, if (isLive) 0 else startMs)
+            if (!viaLg) watch(target, if (isLive) 0 else startMs)
+        }
+    }
+
+    /** Opens StreamBox on an LG TV with the stream address. Null when it worked, otherwise why not. */
+    private suspend fun connectLg(target: Dlna.Device, link: ExtractorLink, name: String, startMs: Long, isLive: Boolean): String? {
+        val me = io { Dlna.localAddressFor(target.host) }.getOrNull() ?: return "this device has no local network address"
+        return try {
+            step = "Connecting to ${target.name}'s remote service…"
+            Lg.connect(target.host) { step = "Accept the prompt shown on the TV…" }
+            step = "Opening StreamBox on the TV…"
+            Lg.launch(StreamProxy.wrapLan(link.url, headersOf(link), me), name, startMs, isLive)
+            null
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+            Lg.close()
+            val m = e.message.orEmpty()
+            when {
+                e is kotlinx.coroutines.TimeoutCancellationException -> "the TV did not answer"
+                m.contains("not found", true) || m.contains("invalid", true) || m.contains("Cannot", true) ->
+                    "StreamBox is not installed on the TV (install StreamBox 1.3.0 from the TV app package) — $m"
+                else -> describe(e)
+            }
         }
     }
 
@@ -244,11 +276,18 @@ object Cast {
     }
 
     fun togglePause() {
+        if (lgMode) {
+            val play = state != "PLAYING"
+            state = if (play) "PLAYING" else "PAUSED_PLAYBACK"
+            scope.launch { runCatching { if (play) Lg.play() else Lg.pause() }.onFailure { App.toast("TV: ${it.message}") } }
+            return
+        }
         if (state == "PLAYING") { state = "PAUSED_PLAYBACK"; act { Dlna.pause(it) } }
         else { state = "TRANSITIONING"; act { Dlna.play(it) } }
     }
 
     fun seekTo(ms: Long) {
+        if (lgMode) { App.toast("Seek with the TV remote"); return }
         val target = ms.coerceIn(0, durationMs.takeIf { it > 0 } ?: Long.MAX_VALUE)
         positionMs = target
         act { Dlna.seek(it, target) }
@@ -259,12 +298,15 @@ object Cast {
     fun changeVolume(step: Int) {
         val v = ((volume ?: return) + step).coerceIn(0, 100)
         volume = v
+        if (lgMode) { scope.launch { runCatching { Lg.setVolume(v) } }; return }
         act { Dlna.setVolume(it, v) }
     }
 
     /** Ends the session; with [tellTv] the TV stops playing too. */
     fun end(tellTv: Boolean = true) {
         val d = device
+        val wasLg = lgMode
+        lgMode = false
         poll?.cancel()
         poll = null
         device = null
@@ -272,7 +314,8 @@ object Cast {
         state = ""
         CastService.stop(App.context)
         scope.launch {
-            if (d != null && tellTv) withContext(Dispatchers.IO) { runCatching { Dlna.stop(d) } }
+            if (wasLg) { if (tellTv) runCatching { Lg.stopApp() }; Lg.close() }
+            else if (d != null && tellTv) withContext(Dispatchers.IO) { runCatching { Dlna.stop(d) } }
             // The TV may still be reading the last bytes: close the proxy a moment later.
             delay(1500)
             if (device == null) StreamProxy.stopLan()
