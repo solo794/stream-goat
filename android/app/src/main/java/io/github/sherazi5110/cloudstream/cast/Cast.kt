@@ -146,10 +146,10 @@ object Cast {
             Lg.connect(target.host) { step = "Accept the prompt shown on the TV…" }
             step = "Opening StreamBox on the TV…"
             val headers = headersOf(link)
-            // The TV loads the stream itself, from the source, so the phone (and its data) is not involved.
-            // A source that wants special headers may refuse the TV; StreamBox then retries through this phone.
+            // The TV loads the stream itself, straight from the source. Only if that fails (a source that wants
+            // special request headers, which a TV player cannot send) does StreamBox on the TV switch to this phone.
             val viaPhone = StreamProxy.wrapLan(link.url, headers, me)
-            Lg.launch(link.url, viaPhone.takeIf { headers.isNotEmpty() }, name, startMs, isLive)
+            Lg.launch(link.url, name, startMs, isLive, fallback = if (headers.isNotEmpty()) viaPhone else null)
             null
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
