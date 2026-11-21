@@ -62,3 +62,11 @@ APKs: `arm64-v8a` (most phones, newer TVs), `armeabi-v7a` (many Android TV boxes
 - `ui/`: Jetpack Compose screens (Home, Search, title page, My list, Extensions, player). `player/`: libVLC.
 
 Nothing is minified: extensions call into the library and its dependencies by name at runtime.
+
+## Casting to a TV
+
+The player's Cast button (top bar) lists the DLNA / UPnP renderers on the Wi-Fi (LG webOS, Samsung, Sony, Kodi…) and
+sends the current source to the one picked; the phone then shows a remote (pause, seek, volume, stop). Sources that
+need headers the TV cannot send are served through the phone (`StreamProxy.wrapLan`), so the phone must stay on the
+same network; a foreground service keeps that going with the screen off. "Screen mirroring" opens the system's own
+cast settings (Miracast / Google Cast). Code: `cast/Dlna.kt`, `cast/Cast.kt`, `cast/CastService.kt`, `ui/CastUi.kt`.
