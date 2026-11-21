@@ -138,8 +138,9 @@ object Lg {
     }
 
     /** Opens the StreamBox app on the TV, handing it the stream address. */
-    suspend fun launch(url: String, title: String, startMs: Long, live: Boolean) {
+    suspend fun launch(url: String, title: String, startMs: Long, live: Boolean, fallback: String? = null) {
         val params = JSONObject().put("castUrl", url).put("title", title).put("startMs", startMs).put("live", live)
+        if (fallback != null) params.put("fallbackUrl", fallback)
         request("ssap://system.launcher/launch", JSONObject().put("id", APP_ID).put("params", params), 15_000)
     }
 
